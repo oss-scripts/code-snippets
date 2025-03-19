@@ -59,8 +59,8 @@ Translate this Arabic text to English:
     
     return " ".join(all_translated)
 
-def translate_pdf_to_txt(input_pdf_path, output_txt_path):
-    """Load PDF, translate content, and save to text file"""
+def translate_specific_page(input_pdf_path, output_txt_path, page_number):
+    """Load PDF, translate specific page content, and save to text file"""
     print(f"Loading PDF: {input_pdf_path}")
     
     # Use PDFPlumberLoader from your existing langchain setup
@@ -68,38 +68,40 @@ def translate_pdf_to_txt(input_pdf_path, output_txt_path):
     pages = loader.load()
     
     total_pages = len(pages)
-    print(f"Total pages: {total_pages}")
+    print(f"PDF has {total_pages} pages in total")
+    
+    # Verify page number is valid (convert from 1-indexed to 0-indexed)
+    page_index = page_number - 1
+    if page_index < 0 or page_index >= total_pages:
+        print(f"Error: Page {page_number} does not exist. PDF has {total_pages} pages.")
+        return False
+    
+    # Get the specified page
+    page = pages[page_index]
+    page_text = page.page_content
     
     # Open output text file
     with open(output_txt_path, 'w', encoding='utf-8') as outfile:
-        # Process each page
-        for i, page in enumerate(tqdm(pages, desc="Translating pages")):
-            page_text = page.page_content
-            
-            # Write page header
-            outfile.write(f"================ PAGE {i+1} ================\n\n")
-            
-            if not page_text.strip():
-                print(f"Page {i+1} appears to be empty or contains only images")
-                outfile.write("[No text content or contains only images]\n\n")
-                continue
-                
-            print(f"Translating page {i+1}/{total_pages}")
+        outfile.write(f"================ PAGE {page_number} ================\n\n")
+        
+        if not page_text.strip():
+            print(f"Page {page_number} appears to be empty or contains only images")
+            outfile.write("[No text content or contains only images]\n")
+        else:
+            print(f"Translating page {page_number}")
             translated_text = translate_text_with_llm(page_text)
             
             # Write translated text to file
-            outfile.write(f"{translated_text}\n\n")
-            
-            # Add page separator
-            if i < total_pages - 1:
-                outfile.write("\n" + "="*50 + "\n\n")
+            outfile.write(f"{translated_text}\n")
     
     print(f"Translation complete! Saved to: {output_txt_path}")
+    return True
 
 def main():
-    parser = argparse.ArgumentParser(description='Translate Arabic PDF to English text file')
+    parser = argparse.ArgumentParser(description='Translate specific page from Arabic PDF to English text file')
     parser.add_argument('input_pdf', help='Path to the input Arabic PDF')
-    parser.add_argument('--output_txt', help='Path for the output text file (default: input_name_translated.txt)')
+    parser.add_argument('--page', type=int, required=True, help='Page number to translate (starting from 1)')
+    parser.add_argument('--output_txt', help='Path for the output text file (default: input_name_page{N}_translated.txt)')
     
     args = parser.parse_args()
     
@@ -111,9 +113,9 @@ def main():
         output_txt = args.output_txt
     else:
         base_name = os.path.splitext(args.input_pdf)[0]
-        output_txt = f"{base_name}_translated.txt"
+        output_txt = f"{base_name}_page{args.page}_translated.txt"
     
-    translate_pdf_to_txt(args.input_pdf, output_txt)
+    translate_specific_page(args.input_pdf, output_txt, args.page)
 
 if __name__ == "__main__":
     main()
