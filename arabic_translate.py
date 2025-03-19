@@ -3,19 +3,34 @@ import sys
 import argparse
 import requests
 import time
+import re
 from tqdm import tqdm
 import PyPDF2
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter, A4
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
-from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
+from reportlab.lib import colors
 from reportlab.lib.units import inch
 
-def translate_text_with_llm(arabic_text, batch_size=1500):
+def translate_text_with_llm(arabic_text, batch_size=1500, preserve_structure=True):
     """Translate Arabic text to English using the existing VLLM endpoint"""
     if not arabic_text or arabic_text.isspace():
         return "[No extractable text content]"
-        
+    
+    # Structure preservation instructions
+    structure_instructions = """
+Pay careful attention to the document structure:
+1. Preserve ALL headings and titles with their exact formatting (e.g., if a line is centered and appears to be a title, translate it as a title)
+2. Keep all bullet points and numbered lists intact
+3. Preserve paragraph breaks exactly as in the original
+4. Maintain table-like structures where present
+5. Keep any section numbering (1.1, 1.2, etc.)
+6. If text appears to be in a special format (headers, footers, captions), maintain that distinction
+7. For text that appears to be a heading (short, possibly centered or bold), translate it and indicate it's a heading by adding [HEADING] at the beginning
+"""
+
     # Break text into manageable chunks to avoid context length issues
     text_chunks = []
     for i in range(0, len(arabic_text), batch_size):
@@ -24,11 +39,12 @@ def translate_text_with_llm(arabic_text, batch_size=1500):
     all_translated = []
     
     for chunk in tqdm(text_chunks, desc="Translating text chunks"):
-        # Create translation prompt
+        # Create translation prompt with structure preservation
+        structure_part = structure_instructions if preserve_structure else ""
+        
         prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 You are a professional translator from Arabic to English. Translate the following Arabic text to English.
-Preserve the original formatting as much as possible, including paragraph breaks.
-If there are unreadable characters or OCR artifacts, try to make sense of the text where possible.
+{structure_part}
 Do not add any explanations or notes - just return the fluent English translation.<|eot_id|>
 <|start_header_id|>user<|end_header_id|>
 Translate this Arabic text to English:
@@ -92,14 +108,15 @@ def extract_text_from_pdf(pdf_path, page_number=None):
                 pages_text = {}
                 for i in range(total_pages):
                     page = pdf_reader.pages[i]
-                    pages_text[i+1] = page.extract_text()
+                    text = page.extract_text()
+                    pages_text[i+1] = text
                 return pages_text, total_pages
                 
     except Exception as e:
         return None, f"Error extracting text: {str(e)}"
 
-def create_pdf_with_translated_text(translated_pages, output_pdf_path, page_to_translate=None):
-    """Create a PDF with translated text"""
+def create_enhanced_pdf_with_translated_text(translated_pages, output_pdf_path, page_to_translate=None):
+    """Create a PDF with translated text that preserves document structure"""
     # Create a PDF document
     doc = SimpleDocTemplate(
         output_pdf_path,
@@ -110,43 +127,88 @@ def create_pdf_with_translated_text(translated_pages, output_pdf_path, page_to_t
         bottomMargin=72
     )
     
+    # Define styles
     styles = getSampleStyleSheet()
+    
+    # Create custom styles for various elements
+    title_style = ParagraphStyle(
+        'Title', 
+        parent=styles['Title'],
+        fontSize=16,
+        alignment=TA_CENTER,
+        spaceAfter=12
+    )
+    
+    heading_style = ParagraphStyle(
+        'Heading', 
+        parent=styles['Heading1'],
+        fontSize=14,
+        spaceAfter=10
+    )
+    
+    subheading_style = ParagraphStyle(
+        'SubHeading', 
+        parent=styles['Heading2'],
+        fontSize=12,
+        spaceAfter=8
+    )
+    
+    normal_style = styles['Normal']
+    
     story = []
     
     # Handle single page or multiple pages
-    if page_to_translate:
-        # Add page header
-        story.append(Paragraph(f"<b>Translated Page {page_to_translate}</b>", styles['Heading1']))
+    pages_to_process = [page_to_translate] if page_to_translate else sorted(translated_pages.keys())
+    
+    for page_num in pages_to_process:
+        # Add page indicator
+        story.append(Paragraph(f"<i>--- Page {page_num} ---</i>", 
+                              ParagraphStyle('PageIndicator', alignment=TA_CENTER, textColor=colors.gray)))
         story.append(Spacer(1, 0.2*inch))
         
-        # Format text with proper paragraph breaks
-        text = translated_pages[page_to_translate]
-        paragraphs = text.split('\n')
-        for para in paragraphs:
-            if para.strip():
-                story.append(Paragraph(para, styles['Normal']))
+        # Process text with structure preservation
+        text = translated_pages[page_num]
+        if not text or text == "[No extractable text content or contains only images]":
+            story.append(Paragraph(text, normal_style))
+            if page_num != pages_to_process[-1]:  # Not the last page
+                story.append(PageBreak())
+            continue
+            
+        # Split text into lines and analyze structure
+        lines = text.split('\n')
+        
+        # Process each line to identify structure
+        for line in lines:
+            line = line.strip()
+            if not line:
+                # Empty line - add space
                 story.append(Spacer(1, 0.1*inch))
-    else:
-        # Process all pages
-        for page_num in sorted(translated_pages.keys()):
-            # Add page header
-            story.append(Paragraph(f"<b>Page {page_num}</b>", styles['Heading1']))
-            story.append(Spacer(1, 0.2*inch))
-            
-            # Format text with proper paragraph breaks
-            text = translated_pages[page_num]
-            paragraphs = text.split('\n')
-            for para in paragraphs:
-                if para.strip():
-                    story.append(Paragraph(para, styles['Normal']))
-                    story.append(Spacer(1, 0.1*inch))
-            
-            # Add page break between pages
-            if page_num < max(translated_pages.keys()):
-                story.append(Paragraph(" ", styles['Normal']))
-                story.append(Spacer(1, 0.5*inch))
-                story.append(Paragraph("<hr/>", styles['Normal']))
-                story.append(Spacer(1, 0.5*inch))
+                continue
+                
+            # Check for headings marked by our translation instructions
+            if line.startswith("[HEADING]"):
+                line = line.replace("[HEADING]", "").strip()
+                story.append(Paragraph(line, heading_style))
+                continue
+                
+            # Check for likely headings (short lines that end with colon or short capitalized lines)
+            if (len(line) < 80 and line.endswith(':')) or (len(line) < 50 and line.isupper()):
+                story.append(Paragraph(line, subheading_style))
+                continue
+                
+            # Check for bullet points or numbered lists
+            if line.startswith('•') or line.startswith('-') or re.match(r'^\d+\.', line):
+                story.append(Paragraph(line, normal_style))
+                story.append(Spacer(1, 0.05*inch))
+                continue
+                
+            # Regular paragraph
+            story.append(Paragraph(line, normal_style))
+            story.append(Spacer(1, 0.1*inch))
+        
+        # Add page break between pages
+        if page_num != pages_to_process[-1]:  # Not the last page
+            story.append(PageBreak())
     
     # Build the PDF
     doc.build(story)
@@ -176,11 +238,12 @@ def translate_specific_page(input_pdf_path, output_pdf_path, page_number):
         print(f"Translating page {page_number}")
         print(f"Extracted text sample: {extracted_text[:100]}...")  # Debug: show sample of extracted text
         
-        translated_text = translate_text_with_llm(extracted_text)
+        # Translate with structure preservation
+        translated_text = translate_text_with_llm(extracted_text, preserve_structure=True)
         translated_pages[page_number] = translated_text
     
-    # Create PDF with translated text
-    create_pdf_with_translated_text(translated_pages, output_pdf_path, page_number)
+    # Create PDF with translated text and enhanced structure
+    create_enhanced_pdf_with_translated_text(translated_pages, output_pdf_path, page_number)
     
     print(f"Translation complete! Saved to: {output_pdf_path}")
     return True
@@ -211,17 +274,18 @@ def translate_all_pages(input_pdf_path, output_pdf_path):
             continue
             
         print(f"Translating page {page_number}/{total_pages}")
-        translated_text = translate_text_with_llm(extracted_text)
+        # Translate with structure preservation
+        translated_text = translate_text_with_llm(extracted_text, preserve_structure=True)
         translated_pages[page_number] = translated_text
     
-    # Create PDF with all translated pages
-    create_pdf_with_translated_text(translated_pages, output_pdf_path)
+    # Create PDF with all translated pages and enhanced structure
+    create_enhanced_pdf_with_translated_text(translated_pages, output_pdf_path)
     
     print(f"Translation complete! Saved to: {output_pdf_path}")
     return True
 
 def main():
-    parser = argparse.ArgumentParser(description='Translate Arabic PDF to English PDF file')
+    parser = argparse.ArgumentParser(description='Translate Arabic PDF to English PDF file with structure preservation')
     parser.add_argument('input_pdf', help='Path to the input Arabic PDF')
     parser.add_argument('--page', type=int, help='Specific page number to translate (starting from 1)')
     parser.add_argument('--output_pdf', help='Path for the output PDF file')
