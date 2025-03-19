@@ -4,7 +4,12 @@ import argparse
 import requests
 import time
 from tqdm import tqdm
-import PyPDF2  # Usually pre-installed or easy to install
+import PyPDF2
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import letter, A4
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.units import inch
 
 def translate_text_with_llm(arabic_text, batch_size=1500):
     """Translate Arabic text to English using the existing VLLM endpoint"""
@@ -93,8 +98,62 @@ def extract_text_from_pdf(pdf_path, page_number=None):
     except Exception as e:
         return None, f"Error extracting text: {str(e)}"
 
-def translate_specific_page(input_pdf_path, output_txt_path, page_number):
-    """Extract specific page from PDF, translate it, and save to text file"""
+def create_pdf_with_translated_text(translated_pages, output_pdf_path, page_to_translate=None):
+    """Create a PDF with translated text"""
+    # Create a PDF document
+    doc = SimpleDocTemplate(
+        output_pdf_path,
+        pagesize=A4,
+        rightMargin=72, 
+        leftMargin=72,
+        topMargin=72, 
+        bottomMargin=72
+    )
+    
+    styles = getSampleStyleSheet()
+    story = []
+    
+    # Handle single page or multiple pages
+    if page_to_translate:
+        # Add page header
+        story.append(Paragraph(f"<b>Translated Page {page_to_translate}</b>", styles['Heading1']))
+        story.append(Spacer(1, 0.2*inch))
+        
+        # Format text with proper paragraph breaks
+        text = translated_pages[page_to_translate]
+        paragraphs = text.split('\n')
+        for para in paragraphs:
+            if para.strip():
+                story.append(Paragraph(para, styles['Normal']))
+                story.append(Spacer(1, 0.1*inch))
+    else:
+        # Process all pages
+        for page_num in sorted(translated_pages.keys()):
+            # Add page header
+            story.append(Paragraph(f"<b>Page {page_num}</b>", styles['Heading1']))
+            story.append(Spacer(1, 0.2*inch))
+            
+            # Format text with proper paragraph breaks
+            text = translated_pages[page_num]
+            paragraphs = text.split('\n')
+            for para in paragraphs:
+                if para.strip():
+                    story.append(Paragraph(para, styles['Normal']))
+                    story.append(Spacer(1, 0.1*inch))
+            
+            # Add page break between pages
+            if page_num < max(translated_pages.keys()):
+                story.append(Paragraph(" ", styles['Normal']))
+                story.append(Spacer(1, 0.5*inch))
+                story.append(Paragraph("<hr/>", styles['Normal']))
+                story.append(Spacer(1, 0.5*inch))
+    
+    # Build the PDF
+    doc.build(story)
+    return True
+
+def translate_specific_page(input_pdf_path, output_pdf_path, page_number):
+    """Extract specific page from PDF, translate it, and save to PDF file"""
     print(f"Loading PDF: {input_pdf_path}")
     
     # Extract text from the specified page
@@ -106,28 +165,28 @@ def translate_specific_page(input_pdf_path, output_txt_path, page_number):
     
     print(f"PDF has {page_info} pages in total")
     
-    # Open output text file
-    with open(output_txt_path, 'w', encoding='utf-8') as outfile:
-        outfile.write(f"================ PAGE {page_number} ================\n\n")
-        
-        extracted_text = page_text[page_number]
-        if not extracted_text or extracted_text.isspace():
-            print(f"Page {page_number} appears to be empty, contains images only, or text couldn't be extracted")
-            outfile.write("[No extractable text content or contains only images]\n")
-        else:
-            print(f"Translating page {page_number}")
-            print(f"Extracted text sample: {extracted_text[:100]}...")  # Debug: show sample of extracted text
-            
-            translated_text = translate_text_with_llm(extracted_text)
-            
-            # Write translated text to file
-            outfile.write(f"{translated_text}\n")
+    # Dictionary to store translated text
+    translated_pages = {}
     
-    print(f"Translation complete! Saved to: {output_txt_path}")
+    extracted_text = page_text[page_number]
+    if not extracted_text or extracted_text.isspace():
+        print(f"Page {page_number} appears to be empty, contains images only, or text couldn't be extracted")
+        translated_pages[page_number] = "[No extractable text content or contains only images]"
+    else:
+        print(f"Translating page {page_number}")
+        print(f"Extracted text sample: {extracted_text[:100]}...")  # Debug: show sample of extracted text
+        
+        translated_text = translate_text_with_llm(extracted_text)
+        translated_pages[page_number] = translated_text
+    
+    # Create PDF with translated text
+    create_pdf_with_translated_text(translated_pages, output_pdf_path, page_number)
+    
+    print(f"Translation complete! Saved to: {output_pdf_path}")
     return True
 
-def translate_all_pages(input_pdf_path, output_txt_path):
-    """Extract all pages from PDF, translate them, and save to text file"""
+def translate_all_pages(input_pdf_path, output_pdf_path):
+    """Extract all pages from PDF, translate them, and save to PDF file"""
     print(f"Loading PDF: {input_pdf_path}")
     
     # Extract text from all pages
@@ -139,38 +198,33 @@ def translate_all_pages(input_pdf_path, output_txt_path):
     
     print(f"PDF has {total_pages} pages in total")
     
-    # Open output text file
-    with open(output_txt_path, 'w', encoding='utf-8') as outfile:
-        # Process each page
-        for page_number in tqdm(range(1, total_pages + 1), desc="Processing pages"):
-            extracted_text = pages_text.get(page_number, "")
-            
-            # Write page header
-            outfile.write(f"================ PAGE {page_number} ================\n\n")
-            
-            if not extracted_text or extracted_text.isspace():
-                print(f"Page {page_number} appears to be empty, contains images only, or text couldn't be extracted")
-                outfile.write("[No extractable text content or contains only images]\n\n")
-                continue
-                
-            print(f"Translating page {page_number}/{total_pages}")
-            translated_text = translate_text_with_llm(extracted_text)
-            
-            # Write translated text to file
-            outfile.write(f"{translated_text}\n\n")
-            
-            # Add page separator
-            if page_number < total_pages:
-                outfile.write("\n" + "="*50 + "\n\n")
+    # Dictionary to store translated text for all pages
+    translated_pages = {}
     
-    print(f"Translation complete! Saved to: {output_txt_path}")
+    # Process each page
+    for page_number in tqdm(range(1, total_pages + 1), desc="Processing pages"):
+        extracted_text = pages_text.get(page_number, "")
+        
+        if not extracted_text or extracted_text.isspace():
+            print(f"Page {page_number} appears to be empty, contains images only, or text couldn't be extracted")
+            translated_pages[page_number] = "[No extractable text content or contains only images]"
+            continue
+            
+        print(f"Translating page {page_number}/{total_pages}")
+        translated_text = translate_text_with_llm(extracted_text)
+        translated_pages[page_number] = translated_text
+    
+    # Create PDF with all translated pages
+    create_pdf_with_translated_text(translated_pages, output_pdf_path)
+    
+    print(f"Translation complete! Saved to: {output_pdf_path}")
     return True
 
 def main():
-    parser = argparse.ArgumentParser(description='Translate Arabic PDF to English text file')
+    parser = argparse.ArgumentParser(description='Translate Arabic PDF to English PDF file')
     parser.add_argument('input_pdf', help='Path to the input Arabic PDF')
     parser.add_argument('--page', type=int, help='Specific page number to translate (starting from 1)')
-    parser.add_argument('--output_txt', help='Path for the output text file')
+    parser.add_argument('--output_pdf', help='Path for the output PDF file')
     
     args = parser.parse_args()
     
@@ -179,20 +233,20 @@ def main():
         sys.exit(1)
     
     # Determine output filename
-    if args.output_txt:
-        output_txt = args.output_txt
+    if args.output_pdf:
+        output_pdf = args.output_pdf
     else:
         base_name = os.path.splitext(args.input_pdf)[0]
         if args.page:
-            output_txt = f"{base_name}_page{args.page}_translated.txt"
+            output_pdf = f"{base_name}_page{args.page}_translated.pdf"
         else:
-            output_txt = f"{base_name}_translated.txt"
+            output_pdf = f"{base_name}_translated.pdf"
     
     # Process either specific page or entire document
     if args.page:
-        translate_specific_page(args.input_pdf, output_txt, args.page)
+        translate_specific_page(args.input_pdf, output_pdf, args.page)
     else:
-        translate_all_pages(args.input_pdf, output_txt)
+        translate_all_pages(args.input_pdf, output_pdf)
 
 if __name__ == "__main__":
     main()
