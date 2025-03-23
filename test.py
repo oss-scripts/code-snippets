@@ -199,14 +199,23 @@ def process_transcript_with_llm(transcript_data, llm_endpoint="http://localhost:
 You are an expert in analyzing customer service call transcripts. Your task is to:
 
 1. Identify which speaker is the Customer and which is the Agent.
+   - The Customer is the one who has a problem, question, or need
+   - The Agent is the one who provides service, asks verification questions, and offers solutions
+   - There MUST be both an AGENT and a CUSTOMER in the transcript
+
 2. Clean up the transcript by removing noise, repetitions, and correcting any obvious transcription errors.
 3. Mask PII (Personally Identifiable Information) like full names, complete addresses, credit card numbers, SSNs, etc. with [MASKED PII].
 4. Return the improved transcript with correct speaker labels (AGENT or CUSTOMER).
 
+Speaker identification guidelines:
+- Agents typically: ask verification questions, follow scripts, provide solutions, use professional language
+- Customers typically: describe problems, answer questions, make requests, provide personal information
+- If a speaker says they "lost a card" or mentions "my account", they are almost certainly the CUSTOMER
+- If a speaker asks for ID, verification information, or explains policies, they are almost certainly the AGENT
+
 Formatting guidelines:
 - Format each speaker turn as "AGENT at [timestamp]: [text]" or "CUSTOMER at [timestamp]: [text]"
 - Preserve all timestamps exactly as provided
-- Only assign speakers as either AGENT or CUSTOMER
 - Ensure the transcript flows naturally with appropriate turn-taking
 - Remove filler words and speech artifacts that don't add meaning<|eot_id|>
 <|start_header_id|>user<|end_header_id|>
@@ -216,13 +225,14 @@ Please process this call transcript, identifying which speaker is the agent and 
 {formatted_input}<|eot_id|>
 <|start_header_id|>assistant<|end_header_id|>"""
 
+    # Rest of the function remains the same
     try:
         response = requests.post(
             llm_endpoint,
             json={
                 "prompt": [prompt],
                 "kwargs": {
-                    "temperature": 0.1,
+                    "temperature": 0.1,  # Using low temperature for more consistent results
                     "max_tokens": 4096,
                     "top_p": 0.9
                 }
@@ -232,6 +242,13 @@ Please process this call transcript, identifying which speaker is the agent and 
         if response.status_code == 200:
             result = response.json()
             processed_transcript = result[0]['outputs'][0]['text']
+            
+            # Validate transcript has both AGENT and CUSTOMER
+            if "AGENT" not in processed_transcript or "CUSTOMER" not in processed_transcript:
+                logging.warning("LLM failed to identify both agent and customer. Retrying with modified prompt.")
+                # Retry with more explicit instruction
+                return retry_with_modified_prompt(transcript_data, llm_endpoint)
+                
             logging.info("LLM successfully processed the transcript")
             return processed_transcript
         else:
@@ -248,6 +265,258 @@ Please process this call transcript, identifying which speaker is the agent and 
             f"{segment['speaker']} at {segment['start_time']}: {segment['text']}"
             for segment in transcript_data
         ])
+
+def retry_with_modified_prompt(transcript_data, llm_endpoint):
+    """
+    Retry transcript processing with a more explicit prompt when speaker identification fails.
+    """
+    # Analyze the conversation to suggest likely speakers
+    likely_customer = None
+    likely_agent = None
+    speaker_scores = {}  # Track evidence for each speaker
+    
+    # Enhanced phrase lists for better identification
+    customer_phrases = [
+        "lost", "my card", "my account", "i want", "i need", "my name is", 
+        "i'm trying to", "i was", "i have a", "i lost", "i can't", "i don't",
+        "help me", "my credit card", "my number", "my phone", "my email",
+        "cancel", "stolen", "fraud", "charge", "payment", "i paid", "i bought",
+        "i ordered", "my order", "refund", "my balance", "my statement"
+    ]
+    
+    agent_phrases = [
+        "can you provide", "what is your", "thank you for", "how can i help", 
+        "may i have", "could you confirm", "i'll need to verify", "for security purposes",
+        "is there anything else", "i understand", "our records", "our system",
+        "let me check", "according to", "i've checked", "i can see", "may i have your",
+        "can i get your", "i'll assist you", "please hold", "let me pull up",
+        "is that correct", "would you like", "thank you for calling", "thank you for your patience",
+        "is there anything else i can help with", "have i resolved", "card ending in"
+    ]
+    
+    # Patterns strongly associated with each role
+    customer_patterns = [
+        r"\b(?:my|our) (?:card|account|order|payment)\b",
+        r"\bi (?:lost|need|want|can't|don't|have a|would like|am trying)\b",
+        r"\bmy (?:name|email|phone|address|balance)\b"
+    ]
+    
+    agent_patterns = [
+        r"\b(?:could|may|can) (?:you|i) (?:have|get|confirm|verify)\b",
+        r"\bfor (?:security|verification|identification) purposes\b",
+        r"\b(?:our|the) (?:records|system|policy|team)\b",
+        r"\bi(?:'ll| will) (?:assist|help|check|verify|need)\b"
+    ]
+    
+    # Initialize score dictionary for each speaker
+    for segment in transcript_data:
+        speaker_num = int(segment["speaker"].split()[-1])
+        if speaker_num not in speaker_scores:
+            speaker_scores[speaker_num] = {"customer": 0, "agent": 0}
+    
+    # First pass: evaluate text-based evidence
+    for i, segment in enumerate(transcript_data):
+        text = segment["text"].lower()
+        speaker_num = int(segment["speaker"].split()[-1])
+        
+        # Check for customer phrases and patterns
+        for phrase in customer_phrases:
+            if phrase in text:
+                speaker_scores[speaker_num]["customer"] += 1
+                
+        for pattern in customer_patterns:
+            if re.search(pattern, text):
+                speaker_scores[speaker_num]["customer"] += 2
+                
+        # Check for agent phrases and patterns
+        for phrase in agent_phrases:
+            if phrase in text:
+                speaker_scores[speaker_num]["agent"] += 1
+                
+        for pattern in agent_patterns:
+            if re.search(pattern, text):
+                speaker_scores[speaker_num]["agent"] += 2
+    
+    # Second pass: analyze conversation structure
+    # Typically agents open and close conversations, ask verification questions
+    if len(transcript_data) > 0:
+        # First speaker is often the agent in call center recordings
+        first_speaker = int(transcript_data[0]["speaker"].split()[-1])
+        speaker_scores[first_speaker]["agent"] += 1
+        
+        # Last speaker is often the agent saying goodbye/closing
+        last_speaker = int(transcript_data[-1]["speaker"].split()[-1])
+        speaker_scores[last_speaker]["agent"] += 1
+    
+    # Look for question-answer patterns
+    for i in range(len(transcript_data) - 1):
+        current_text = transcript_data[i]["text"].lower()
+        next_text = transcript_data[i+1]["text"].lower()
+        current_speaker = int(transcript_data[i]["speaker"].split()[-1])
+        next_speaker = int(transcript_data[i+1]["speaker"].split()[-1])
+        
+        # If current text ends with question mark and speakers are different
+        if current_text.endswith("?") and current_speaker != next_speaker:
+            # Question askers are more likely to be agents
+            speaker_scores[current_speaker]["agent"] += 1
+            # Question answerers are more likely to be customers
+            speaker_scores[next_speaker]["customer"] += 1
+    
+    # Identify the most likely customer and agent based on scores
+    for speaker, scores in speaker_scores.items():
+        # If clear customer signals and not yet assigned
+        if scores["customer"] > scores["agent"] and likely_customer is None:
+            likely_customer = speaker
+        # If clear agent signals and not yet assigned
+        elif scores["agent"] > scores["customer"] and likely_agent is None:
+            likely_agent = speaker
+    
+    # If we still haven't identified, use the highest relative scores
+    if likely_customer is None or likely_agent is None:
+        # Find highest customer score
+        if likely_customer is None:
+            max_customer_score = -1
+            for speaker, scores in speaker_scores.items():
+                if speaker != likely_agent and scores["customer"] > max_customer_score:
+                    max_customer_score = scores["customer"]
+                    likely_customer = speaker
+        
+        # Find highest agent score
+        if likely_agent is None:
+            max_agent_score = -1
+            for speaker, scores in speaker_scores.items():
+                if speaker != likely_customer and scores["agent"] > max_agent_score:
+                    max_agent_score = scores["agent"]
+                    likely_agent = speaker
+    
+    # If we still couldn't identify both roles, make educated guesses
+    if likely_customer is None and likely_agent is None:
+        # Look at total speaking time/length
+        speaker_words = {}
+        for segment in transcript_data:
+            speaker_num = int(segment["speaker"].split()[-1])
+            if speaker_num not in speaker_words:
+                speaker_words[speaker_num] = 0
+            speaker_words[speaker_num] += len(segment["text"].split())
+        
+        # Sort speakers by word count (ascending)
+        sorted_speakers = sorted(speaker_words.items(), key=lambda x: x[1])
+        if len(sorted_speakers) >= 2:
+            # Typically agents speak more in service calls
+            likely_agent = sorted_speakers[-1][0]  # Most words
+            likely_customer = sorted_speakers[0][0]  # Fewest words
+    
+    # Create a more explicit prompt with speaker hints
+    formatted_input = ""
+    for segment in transcript_data:
+        current_speaker = int(segment["speaker"].split()[-1])
+        speaker_hint = ""
+        
+        if current_speaker == likely_customer:
+            evidence = []
+            if speaker_scores.get(current_speaker, {}).get("customer", 0) > 0:
+                evidence.append(f"score: {speaker_scores[current_speaker]['customer']}")
+            speaker_hint = f" (likely CUSTOMER - {', '.join(evidence)})" if evidence else " (likely CUSTOMER)"
+        elif current_speaker == likely_agent:
+            evidence = []
+            if speaker_scores.get(current_speaker, {}).get("agent", 0) > 0:
+                evidence.append(f"score: {speaker_scores[current_speaker]['agent']}")
+            speaker_hint = f" (likely AGENT - {', '.join(evidence)})" if evidence else " (likely AGENT)"
+            
+        formatted_input += f"{segment['speaker']}{speaker_hint} at {segment['start_time']}: {segment['text']}\n\n"
+    
+    prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+You are an expert in analyzing customer service call transcripts. I've provided speaker hints based on detailed content analysis.
+Your task is to correctly identify speakers and clean the transcript.
+
+IMPORTANT: You MUST label speakers as either "AGENT" or "CUSTOMER" - each conversation MUST have both roles.
+- AGENT: The customer service representative who helps solve issues, asks verification questions, provides information
+- CUSTOMER: The person who has called with a problem, question, or need related to their account, card, or service
+
+Context clues for CUSTOMER:
+- Mentions personal issues: "I lost my card", "my account", "I need help with"
+- Provides personal information when asked
+- Describes problems they're experiencing
+- Makes requests for assistance
+- Often speaks less overall than the agent
+
+Context clues for AGENT:
+- Uses professional language and scripted phrases
+- Asks verification questions: "Can I have your account number?", "What's your name?"
+- Explains policies or procedures: "For security purposes", "According to our policy"
+- Offers solutions: "I can help you with that", "Let me check that for you"
+- Often begins and ends the conversation
+
+For each turn, output exactly in this format:
+"AGENT at [timestamp]: [cleaned text]" or "CUSTOMER at [timestamp]: [cleaned text]"<|eot_id|>
+<|start_header_id|>user<|end_header_id|>
+
+Please correctly identify speakers and clean this transcript:
+
+{formatted_input}<|eot_id|>
+<|start_header_id|>assistant<|end_header_id|>"""
+
+    # The rest of the function remains the same
+    try:
+        response = requests.post(
+            llm_endpoint,
+            json={
+                "prompt": [prompt],
+                "kwargs": {
+                    "temperature": 0.05,  # Even lower temperature
+                    "max_tokens": 4096,
+                    "top_p": 0.9
+                }
+            }
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            processed_transcript = result[0]['outputs'][0]['text']
+            logging.info("Successfully processed transcript on retry")
+            return processed_transcript
+        else:
+            logging.error(f"Error from LLM API during retry: {response.status_code}")
+            # Last resort fallback - manually assign roles based on our heuristic
+            return create_fallback_transcript(transcript_data, likely_customer, likely_agent)
+    except Exception as e:
+        logging.error(f"Error during LLM retry: {str(e)}")
+        return create_fallback_transcript(transcript_data, likely_customer, likely_agent)
+
+def create_fallback_transcript(transcript_data, likely_customer, likely_agent):
+    """
+    Create a transcript with speakers manually assigned based on heuristics
+    when LLM processing fails.
+    """
+    fallback_transcript = []
+    
+    # If we couldn't identify roles, make some assumptions
+    if likely_customer is None and likely_agent is None:
+        # Assume even/odd pattern - first speaker is customer in most calls
+        for segment in transcript_data:
+            speaker_num = int(segment["speaker"].split()[-1])
+            role = "CUSTOMER" if speaker_num % 2 == 1 else "AGENT"
+            fallback_transcript.append(
+                f"{role} at {segment['start_time']}: {segment['text']}"
+            )
+    else:
+        # Use identified roles
+        for segment in transcript_data:
+            speaker_num = int(segment["speaker"].split()[-1])
+            if speaker_num == likely_customer:
+                role = "CUSTOMER"
+            elif speaker_num == likely_agent:
+                role = "AGENT"
+            else:
+                # For any other speakers, make a best guess
+                role = "CUSTOMER" if likely_customer is None else ("AGENT" if likely_agent is None else "SPEAKER")
+            
+            fallback_transcript.append(
+                f"{role} at {segment['start_time']}: {segment['text']}"
+            )
+    
+    logging.warning("Using fallback transcript with rule-based speaker assignment")
+    return "\n".join(fallback_transcript)
 
 def process_files_from_csv(csv_path, output_dir, model_size, language, num_speakers, use_llm=True, llm_endpoint="http://localhost:8503/llama_generate"):
     """
