@@ -16,6 +16,8 @@ import logging
 import requests
 import time
 import re
+import subprocess
+import tempfile
 import json
 
 # Configure logging
@@ -52,6 +54,54 @@ def load_audio_object():
     """
     return Audio()
 
+def convert_audio_format(input_path, output_path=None):
+    """
+    Convert audio file to a standard format that pyannote can process.
+    Uses ffmpeg to convert g.711 mu-law to standard PCM WAV.
+    """
+    if output_path is None:
+        # Create a temporary file with .wav extension
+        temp_dir = tempfile.gettempdir()
+        output_path = os.path.join(temp_dir, f"temp_{os.path.basename(input_path)}")
+    
+    logging.info(f"Converting audio format: {input_path} -> {output_path}")
+    
+    try:
+        # Convert to standard 16-bit PCM WAV at 16kHz (good for speech processing)
+        cmd = [
+            "ffmpeg", "-y", "-i", input_path,
+            "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+            output_path
+        ]
+        subprocess.run(cmd, check=True, capture_output=True)
+        return output_path
+    except Exception as e:
+        logging.error(f"Error converting audio format: {str(e)}")
+        return input_path  # Return original path if conversion fails
+
+def get_audio_duration(audio_path):
+    """
+    Get the duration of an audio file using ffprobe.
+    """
+    cmd = [
+        "ffprobe", "-v", "error", "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1", audio_path
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        return float(result.stdout.strip())
+    except Exception as e:
+        logging.error(f"Error getting audio duration: {str(e)}")
+        # Fall back to wave if ffprobe fails
+        try:
+            with contextlib.closing(wave.open(audio_path, 'r')) as f:
+                frames = f.getnframes()
+                rate = f.getframerate()
+                return frames / float(rate)
+        except Exception as e2:
+            logging.error(f"Wave fallback also failed: {str(e2)}")
+            return 0.0
+
 def segment_embedding(segment, duration, audio_path, embedding_model, audio_obj):
     """
     Given a segment from Whisper, calculate the speaker embedding.
@@ -59,13 +109,19 @@ def segment_embedding(segment, duration, audio_path, embedding_model, audio_obj)
     start = segment["start"]
     end = min(duration, segment["end"])  # Adjust for potential overshoot
     clip = Segment(start, end)
-    waveform, sample_rate = audio_obj.crop(audio_path, clip)
-    # Convert stereo to mono if needed
-    if waveform.shape[0] > 1:
-        waveform = waveform.mean(axis=0, keepdims=True)
-    # Add a batch dimension: shape becomes (1, channels, samples)
-    embedding = embedding_model(waveform[None])
-    return embedding
+    
+    try:
+        waveform, sample_rate = audio_obj.crop(audio_path, clip)
+        # Convert stereo to mono if needed
+        if waveform.shape[0] > 1:
+            waveform = waveform.mean(axis=0, keepdims=True)
+        # Add a batch dimension: shape becomes (1, channels, samples)
+        embedding = embedding_model(waveform[None])
+        return embedding
+    except Exception as e:
+        logging.error(f"Error in segment embedding: {str(e)}")
+        # Return zeros array as fallback
+        return np.zeros(192)
 
 def format_time(secs: float):
     """
@@ -85,19 +141,18 @@ def run_diarization(
     and return the segmented transcript with speaker labels.
     """
     logging.info(f"Transcribing audio file: {file_path}")
+    # Whisper can handle various formats through ffmpeg
     result = whisper_model.transcribe(file_path, language='en')
     segments = result["segments"]
 
-    # Determine audio duration using wave
-    with contextlib.closing(wave.open(file_path, 'r')) as f:
-        frames = f.getnframes()
-        rate = f.getframerate()
-        duration = frames / float(rate)
+    # For diarization, convert to standard format that pyannote can handle
+    converted_audio_path = convert_audio_format(file_path)
+    duration = get_audio_duration(converted_audio_path)
 
     logging.info("Extracting embeddings from audio segments")
     embeddings = np.zeros(shape=(len(segments), 192))
     for i, segment in enumerate(segments):
-        embeddings[i] = segment_embedding(segment, duration, file_path, embedding_model, audio_obj)
+        embeddings[i] = segment_embedding(segment, duration, converted_audio_path, embedding_model, audio_obj)
 
     embeddings = np.nan_to_num(embeddings)
 
@@ -105,20 +160,25 @@ def run_diarization(
     clustering = AgglomerativeClustering(n_clusters=num_speakers).fit(embeddings)
     labels = clustering.labels_
 
-    for i, segment in enumerate(segments):
-        segment["speaker"] = f'SPEAKER {labels[i] + 1}'
+    # Clean up temporary file if we created one
+    if converted_audio_path != file_path and os.path.exists(converted_audio_path):
+        try:
+            os.remove(converted_audio_path)
+            logging.info(f"Cleaned up temporary file: {converted_audio_path}")
+        except Exception as e:
+            logging.warning(f"Could not remove temporary file: {str(e)}")
 
     # Prepare data for LLM post-processing
     transcript_data = []
-    for segment in segments:
+    for i, segment in enumerate(segments):
         transcript_data.append({
-            "speaker": segment["speaker"],
+            "speaker": f'SPEAKER {labels[i] + 1}',
             "start_time": format_time(segment["start"]),
             "text": segment["text"].strip(),
             "start_seconds": segment["start"]
         })
 
-    # Return both the raw transcript data and formatted transcript
+    # Return the transcript data
     return transcript_data
 
 def process_transcript_with_llm(transcript_data, llm_endpoint="http://localhost:8503/llama_generate"):
