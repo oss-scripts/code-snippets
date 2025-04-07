@@ -1,31 +1,37 @@
-# ...existing code...
-
-class FileQueryRequest(BaseModel):
-    query: str
-    meta_list: List[Dict[str, Any]]
-
 @app.post('/query-files')
 async def query_files(request: FileQueryRequest):
     try:
-        # Use the file metadata provided in the payload
-        file_info = request.meta_list
+        # Use the file metadata provided in the payload - make a deep copy to avoid modifying original
+        import copy
+        file_info = copy.deepcopy(request.meta_list)
         query = request.query.lower()
         
         # Convert all timestamps to datetime objects for comparison
         from datetime import datetime, timedelta
         import dateutil.parser
         
-        # Process dates in file metadata
+        # Create a JSON-serializable version of file_info for the LLM
+        json_safe_file_info = []
         for file in file_info:
+            # Create a copy without datetime objects
+            safe_file = {}
+            for key, value in file.items():
+                if key != "upload_datetime":  # Skip the datetime field we'll add
+                    safe_file[key] = value
+                    
+            # Process timestamps
             if "Time of Upload" in file:
                 try:
+                    # Add as separate field for our use
                     file["upload_datetime"] = dateutil.parser.parse(file["Time of Upload"])
-                except:
+                except Exception as e:
+                    print(f"Error parsing date: {str(e)}")
                     # If parsing fails, set a default old date
                     file["upload_datetime"] = datetime(2000, 1, 1)
+                    
+            json_safe_file_info.append(safe_file)
         
-        # Check if we can answer with direct logic before using LLM
-        # Get current date for time-based comparisons
+        # Current date for time-based comparisons
         current_date = datetime.now()
         
         # Handle user-based queries directly
@@ -94,15 +100,26 @@ async def query_files(request: FileQueryRequest):
                     "files": [f.get("Document Name") for f in matching_files],
                     "count": len(matching_files)
                 })
-            except:
-                pass  # If date parsing fails, continue to LLM
+            except Exception as e:
+                print(f"Date parsing error: {str(e)}")
+                # If date parsing fails, continue to LLM
         
         # If no direct patterns match, use LLM for more complex queries
+        # Use a custom JSON encoder to properly handle the conversion
+        class CustomEncoder(json.JSONEncoder):
+            def default(self, obj):
+                if isinstance(obj, datetime):
+                    return obj.isoformat()
+                return str(obj)  # Convert any other non-serializable objects to strings
+        
+        # Convert to properly formatted JSON string
+        file_info_json = json.dumps(json_safe_file_info, cls=CustomEncoder, indent=2)
+        
         # Prepare the prompt for the LLM
         prompt = f"""
         You are a file query assistant. Answer questions about the following files:
         
-        {json.dumps(file_info, indent=2)}
+        {file_info_json}
         
         User query: {request.query}
         
@@ -135,18 +152,20 @@ async def query_files(request: FileQueryRequest):
         
         # Try to extract file names mentioned in the response
         try:
-            file_names = [file["Document Name"] for file in file_info]
-            mentioned_files = [f for f in file_names if f in answer]
+            file_names = [file.get("Document Name", "") for file in file_info if "Document Name" in file]
+            mentioned_files = [f for f in file_names if f and f in answer]
             if mentioned_files:
                 response["files"] = mentioned_files
-        except Exception:
+        except Exception as e:
+            print(f"Error extracting mentioned files: {str(e)}")
             # If extraction fails, just continue with the general response
-            pass
                 
         return JSONResponse(content=response)
             
     except Exception as e:
+        import traceback
         print(f"Error processing file query: {str(e)}")
+        print(f"Traceback: {traceback.format_exc()}")
         return JSONResponse(
             status_code=500,
             content={'error': str(e)}
