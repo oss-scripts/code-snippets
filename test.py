@@ -1,18 +1,28 @@
-def filter_retrieved_documents(query, category, k=7, threshold=0.5):
+from langchain_core.retrievers import BaseRetriever
+from langchain.schema.document import Document
+from pydantic import Field
+
+class CustomRetriever(BaseRetriever):
+    docs: List[Document] = Field(default_factory=list)
+    class Config:
+        arbitrary_types_allowed = True
+
+    def _get_relevant_documents(self, query: str) -> List[Document]:
+        return self.docs
+        
+    async def _aget_relevant_documents(self, query: str) -> List[Document]:
+        return self.docs
+
+def filter_retrieved_documents(query, category, k=7, threshold=0.7):
 
     search_kwargs = {"k": k}
     if category != 'Admin':
         search_kwargs["filter"] = {'Category': category}
     docs_with_scores = vectorstore_faiss.similarity_search_with_score(query, **search_kwargs)
     sorted_docs = sorted(docs_with_scores, key=lambda x: x[1], reverse=True)
-    filtered_docs = [doc for doc, score in sorted_docs if score >= threshold]
+    filtered_docs = [doc for doc, score in sorted_docs]
     return filtered_docs
 
-class DummyRetriever:
-    def __init__(self, docs):
-        self.docs = docs
-    def get_relevant_documents(self, _):
-        return self.docs
 
 def retrieve_docs_faiss_followup(query,embedding,is_arabic,chat_history,category):
     print("Is the question in arabic language ",is_arabic)
@@ -41,12 +51,12 @@ def retrieve_docs_faiss_followup(query,embedding,is_arabic,chat_history,category
 
 
     filtered_docs = filter_retrieved_documents(query, category, k=7, threshold=0.75)
-    dummy_retriever = DummyRetriever(filtered_docs)
+    retriever = CustomRetriever(docs=filtered_docs)
     
     qa = RetrievalQA.from_chain_type(
         llm=llm,
         chain_type="stuff",
-        retriever=dummy_retriever,
+        retriever=retriever,
         return_source_documents=True,
         chain_type_kwargs={"verbose": True, "prompt": prompt}
     )
