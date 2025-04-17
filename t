@@ -1,54 +1,175 @@
-from langchain.embeddings.openai import OpenAIEmbeddings
-from langchain.vectorstores import FAISS
-from langchain.llms import OpenAI
-from langchain.chains import RetrievalQA
-from langchain.schema import Document
-from langchain.retrievers.base import BaseRetriever
+def retrieve_docs_faiss_followup(query, embedding, is_arabic, chat_history, category):
+    print("Is the question in arabic language ", is_arabic)
+    print("Filter on category :", category)
+    print("**********************")
+    print("CHAT HISTORY", chat_history)
+    if len(category) == 1:
+        category = category[0]
+    else:
+        category = category
 
-# 1. your documents
-docs = [
-    Document(page_content="…", metadata={"source": "doc1.txt"}),
-    Document(page_content="…", metadata={"source": "doc2.txt"}),
-    Document(page_content="…", metadata={"source": "doc3.txt"}),
-]
+    flagging_prompt = PromptTemplate(template=flagging_prompt_template, input_variables=["question"])
+    classifier_llm = LLama3LLM()  
+ 
+    def classify_question(question):
+        flagging_chain = LLMChain(llm=classifier_llm, prompt=flagging_prompt)
+        classification = flagging_chain.run(question)
+        return classification
 
-# 2. build FAISS
-emb = OpenAIEmbeddings()
-vect = FAISS.from_documents(docs, emb)
+    prompt = PromptTemplate(template=prompt_template2, input_variables=["context", "question"])
+    llm = LLama3LLM()
 
-# 3. custom retriever that injects score into metadata
-class ScoredRetriever(BaseRetriever):
-    def __init__(self, vectorstore: FAISS, k: int = 5):
-        self.vectorstore = vectorstore
-        self.k = k
-    def get_relevant_documents(self, query: str):
-        docs_and_scores = self.vectorstore.similarity_search_with_score(query, k=self.k)
-        scored_docs = []
-        for doc, score in docs_and_scores:
-            doc.metadata["score"] = score
-            scored_docs.append(doc)
-        return scored_docs
+    # Create a custom retriever that preserves relevance scores
+    if category == 'Admin':
+        retriever = vectorstore_faiss.as_retriever(
+            search_type='similarity', 
+            search_kwargs={"k": 7},
+            return_source_documents=True
+        )
+    else:
+        retriever = vectorstore_faiss.as_retriever(
+            search_type='similarity', 
+            search_kwargs={"k": 7, "filter": {'Category': category}},
+            return_source_documents=True
+        )
+    
+    # Create QA chain with the retriever
+    qa = RetrievalQA.from_chain_type(
+        llm=llm,
+        chain_type="stuff",
+        retriever=retriever,
+        return_source_documents=True,
+        chain_type_kwargs={"verbose": True, "prompt": prompt}
+    )
+            
+    def answer_question(question, chat_history):
+        result = {}
+        
+        if is_arabic:
+            translated_question = translate_arabic_question(question)
+            print("****************************************")
+            print('TRANSLATED QUESTION', translated_question)
+            print("****************************************")
 
-retriever = ScoredRetriever(vect, k=5)
+            query_type = classify_query_with_llm(translated_question, classifier_llm)
+            
+            if query_type == "file_metadata":
+                answer, docs = process_file_query(translated_question, category, classifier_llm)
+                final_answer = refine_arabic_answer(answer)
+                results = {'response': final_answer, 'documents': docs, 'page_numbers': [1] * len(docs)}
+                return results
 
-# 4. build chain
-qa = RetrievalQA.from_chain_type(
-    llm=OpenAI(model_name="gpt-3.5‑turbo"),
-    chain_type="stuff",
-    retriever=retriever,
-    return_source_documents=True,
-)
+            if(classify_question(translated_question)=="Yes"):
+                result['result'] = "Hi I am a QnA bot, please feel free to ask a relevant question."
+                results={'response':result['result'],'documents':[],'page_numbers':[]}
+            else:
+                # Get raw results from the vectorstore to capture relevance scores
+                raw_docs_with_scores = vectorstore_faiss.similarity_search_with_score(
+                    translated_question, 
+                    k=7,
+                    filter={'Category': category} if category != 'Admin' else None
+                )
+                
+                # Sort by relevance score (lower is better in FAISS with cosine similarity)
+                sorted_docs_with_scores = sorted(raw_docs_with_scores, key=lambda x: x[1])
+                
+                # Run the QA chain
+                result = qa({"query": translated_question})
+                
+                if(("I don't know, please ask another question" in result['result']) or ("I apologize" in result['result'])):
+                    results = {'response': result['result'], 'documents': [], 'page_numbers': [], 'relevance_scores': []}
+                else:
+                    if len(result['source_documents']) == 0:
+                        result['result'] = "No information available in the LoB documents."
+                        document_name = []
+                        page_number = []
+                        relevance_scores = []
+                    else:
+                        # Extract document info in order of relevance
+                        document_name = []
+                        page_number = []
+                        relevance_scores = []
+                        
+                        # Use the sorted documents from our direct similarity search
+                        for doc, score in sorted_docs_with_scores:
+                            file = doc.metadata['file_path'].split('/')[-1]
+                            page = doc.metadata['page'] + 1
+                            document_name.append(file)
+                            page_number.append(page)
+                            relevance_scores.append(float(score))  # Convert to float for JSON serialization
+                
+                    results = {
+                        'response': result['result'],
+                        'documents': document_name,
+                        'page_numbers': page_number,
+                        'relevance_scores': relevance_scores  # Add relevance scores to response
+                    }
+                    
+            final_answer = refine_arabic_answer(results['response'])
+            results['response'] = final_answer
+            return results
+        else:
+            if(classify_question(question)=="Yes"):
+                result['result'] = "Hi I am a QnA bot, please feel free to ask a relevant question."
+                results = {'response': result['result'], 'documents': [], 'page_numbers': [], 'relevance_scores': []}
+            else:
+                query_type = classify_query_with_llm(question, classifier_llm)
+            
+                if query_type == "file_metadata":
+                    answer, docs = process_file_query(question, category, classifier_llm)
+                    return {'response': answer, 'documents': docs, 'page_numbers': [1] * len(docs), 'relevance_scores': [0] * len(docs)}
 
-def run(query: str):
-    out = qa({"query": query})
-    answer = out["result"]
-    sources = out["source_documents"]
-    return answer, sources
+                contexualized_question = followup_question([chat_history, question])
+                print("-----------------------------------")
+                print("this is contexual question")
+                print(contexualized_question)
+                print("-----------------------------------")
+                
+                # Get raw results from the vectorstore to capture relevance scores
+                raw_docs_with_scores = vectorstore_faiss.similarity_search_with_score(
+                    contexualized_question, 
+                    k=7,
+                    filter={'Category': category} if category != 'Admin' else None
+                )
+                
+                # Sort by relevance score (lower is better with cosine similarity)
+                sorted_docs_with_scores = sorted(raw_docs_with_scores, key=lambda x: x[1])
+                
+                result = qa({"query": contexualized_question})
+                
+                if(("I don't know, please ask another question" in result['result']) or ("I apologize" in result['result'])):
+                    results = {'response': result['result'], 'documents': [], 'page_numbers': [], 'relevance_scores': []}
+                else:
+                    if len(result['source_documents']) == 0:
+                        result['result'] = "No information available in the LoB documents."
+                        document_name = []
+                        page_number = []
+                        relevance_scores = []
+                    else:
+                        # Extract document info in order of relevance
+                        document_name = []
+                        page_number = []
+                        relevance_scores = []
+                        
+                        # Use the sorted documents from our direct similarity search
+                        for doc, score in sorted_docs_with_scores:
+                            file = doc.metadata['file_path'].split('/')[-1]
+                            page = doc.metadata['page'] + 1
+                            document_name.append(file)
+                            page_number.append(page)
+                            relevance_scores.append(float(score))  # Convert to float for JSON serialization
+                
+                    results = {
+                        'response': result['result'],
+                        'documents': document_name,
+                        'page_numbers': page_number,
+                        'relevance_scores': relevance_scores  # Add relevance scores to response
+                    }
+                    
+            return results
+                
+    answer = answer_question(query, chat_history)
+    print("********************")
+    print(answer)
 
-if __name__ == "__main__":
-    ans, srcs = run("Your question here")
-    print("Answer:", ans)
-    print("\nSources with scores:")
-    for d in srcs:
-        print(f"{d.metadata['source']} – score {d.metadata['score']:.4f}")
-        print(d.page_content, "\n")
+    return answer
