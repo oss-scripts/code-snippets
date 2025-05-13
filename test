@@ -1,18 +1,41 @@
-# Call the server using curl:
-curl -X POST "http://localhost:8000/v1/chat/completions" \
-	-H "Content-Type: application/json" \
-	--data '{
-		"model": "google/gemma-3-27b-it",
-		"messages": [
-			{
-				"role": "user",
-				"content": [
-					{
-						"type": "text",
-						"text": "You are a helpful assistent give me joke on bear"
-					},
-					
-				]
-			}
-		]
-	}'
+import requests
+import json
+
+def run_vllm_query():
+    url = "http://localhost:8000/v1/chat/completions"
+    
+    headers = {
+        "Content-Type": "application/json"
+    }
+    
+    payload = {
+        "model": "google/gemma-3-27b-it",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Describe this image in one sentence."
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "https://cdn.britannica.com/61/93061-050-99147DCE/Statue-of-Liberty-Island-New-York-Bay.jpg"
+                        }
+                    }
+                ]
+            }
+        ]
+    }
+    
+    response = requests.post(url, headers=headers, json=payload)
+    
+    # Print the response
+    print(response.status_code)
+    print(json.dumps(response.json(), indent=2))
+    
+    return response.json()
+
+if __name__ == "__main__":
+    run_vllm_query()
