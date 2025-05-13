@@ -1,0 +1,18 @@
+# Call the server using curl:
+curl -X POST "http://localhost:8000/v1/chat/completions" \
+	-H "Content-Type: application/json" \
+	--data '{
+		"model": "google/gemma-3-27b-it",
+		"messages": [
+			{
+				"role": "user",
+				"content": [
+					{
+						"type": "text",
+						"text": "You are a helpful assistent give me joke on bear"
+					},
+					
+				]
+			}
+		]
+	}'
