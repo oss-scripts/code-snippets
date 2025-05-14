@@ -1,0 +1,70 @@
+class Gemma3LLM(BaseLLM):
+    def __init__(self, server_url="http://0.0.0.0:8000"):  # vLLM default port is 8000
+        super(Gemma3LLM, self).__init__()
+        self.server_url = server_url
+        self.callbacks = None
+        self.verbose = False
+        self.tags = None
+        self.metadata = None
+        self.cache = None
+        
+    @property
+    def _default_params(self) -> Dict[str,Any]:
+        return {}
+    
+    @root_validator(allow_reuse=True)
+    def validate_environment(cls, values: Dict) -> Dict:
+        return values
+    
+    @property
+    def _llm_type(self) -> str:
+        return "vllm"
+        
+    def _generate(
+        self, 
+        prompts: List[str],
+        params: dict = {'temperature': 0.0, 'top_p': 1.0, 'max_tokens': 1024,
+                        'stop': ['Note', 'Please']},
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[CallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> LLMResult:
+        generations = []
+        
+        for prompt in prompts:
+            # Format for OpenAI-compatible chat endpoint
+            request_body = {
+                "model": "gemma-3-27b-it",  # Model name
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": params.get("temperature", 0.0),
+                "top_p": params.get("top_p", 1.0),
+                "max_tokens": params.get("max_tokens", 1024),
+            }
+            
+            # Add stop sequences if specified
+            if params.get("stop") or stop:
+                request_body["stop"] = params.get("stop", []) if params.get("stop") else stop
+            
+            # Adding any other parameters that might be specified
+            for key, value in params.items():
+                if key not in request_body and key not in ["stop"]:
+                    request_body[key] = value
+                    
+            response = requests.post(
+                f"{self.server_url}/v1/chat/completions",  # OpenAI compatible chat endpoint
+                json=request_body,
+            )
+            
+            if response.status_code != 200:
+                raise ValueError(f"Error from vLLM server: {response.text}")
+                
+            output = response.json()
+            
+            # Parse the OpenAI-compatible chat response format
+            if "choices" in output and len(output["choices"]) > 0:
+                text = output["choices"][0]["message"]["content"]
+                generations.append([Generation(text=text)])
+            else:
+                raise ValueError(f"Unexpected response format: {output}")
+                
+        return LLMResult(generations=generations)
