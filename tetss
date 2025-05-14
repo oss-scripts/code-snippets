@@ -1,0 +1,160 @@
+from langchain_core.language_models.llms import BaseLLM
+from typing import Any,Dict,List,Optional
+from langchain_core.pydantic_v1 import root_validator
+from langchain_core.callbacks.manager import CallbackManagerForLLMRun
+from langchain_core.outputs import Generation,LLMResult
+from langchain.prompts import PromptTemplate
+from langchain.chains import LLMChain,RetrievalQA
+import requests
+
+flagging_prompt_template = """<start_of_turn>system
+You are an intelligent classifier designed to analyze user questions.
+Your task is to determine whether the question is a form of casual conversation(small talk,like hi,hello,etc),
+or if it requires detailed information that can only be found in spefic documents(needs context),
+or it is a followup question.
+Examples of small talk questions include:
+
+- How are you?
+- Hi
+- Hey
+- Hello
+- Whatsup
+- How are you feeling today?
+- What"s your favorite color?
+- Do you like music?
+- How is the weather today?
+- Did you eat well ?
+- How was your weekend?
+- how are your kids doing?
+Example of followup questions include:
+- can you provide bullet points for the last answer
+- summarize the last answer in simple words
+- are there any more points for the last answer?
+- are the any more points for the above list ?
+- summarize the last two points better
+- are there any more points ?
+- is there anything else?
+- summarize the answer in 80 words
+- and address?
+- and contact details?
+-please elaborate
+Answer only with "Yes" if it is a small talk or "No" is it is not.<end_of_turn>
+<start_of_turn>user
+Question:{question}<end_of_turn>
+<start_of_turn>model
+"""
+
+prompt_template2 = """<start_of_turn>system
+You are an assistant for question-answering tasks.
+Use the following pieces of content to answer the question.
+{context}
+Answer questions strictly based on the given content
+If a question involves sexual violence, political opinions, or any other inappropriate, absurd, nonsensical or non-banking related or sensitive content, strictly respond with "I don't know, please ask another question"
+If a question cannot be answered from the provided content, strictly respond with "I don't know, please ask another question".
+If the question is strictly targetted towards you like "How do you work", "What is your name", etc and not related to the given context, strictly respond with "I don't know, please ask another question".
+If the question asks the answer to be in bullet points, try your best to break the answer in appropriate bullet points.
+And never give incomplete answers i.e. answers should not break somewhere or end abruptly. They should be grammatically correct and always end with a full stop.<end_of_turn>
+<start_of_turn>user
+Question:{question}<end_of_turn>
+<start_of_turn>model
+"""
+
+# Update the translation function templates
+def translate_arabic_question(question):
+    refine_template = """<start_of_turn>system
+    You are an assistant dedicated to translate Arabic Text to English Text.
+    Your task is to translate user question.
+    The response should be english translated version of the question.
+    Strictly return English version of the question only.<end_of_turn>
+    <start_of_turn>user
+    Question: {question}<end_of_turn>
+    <start_of_turn>model
+    """
+
+    prompt = PromptTemplate(template=refine_template, input_variables=["question"])
+    refined_chain = LLMChain(llm=llm, prompt=prompt)
+    translated_question=refined_chain.run(question)
+    return translated_question
+
+def refine_arabic_answer(answer):
+    refine_template = """<start_of_turn>system
+    You are an assistant dedicated to translate English text to Arabic text.
+    Your task is to take the provided answer and translate without adding your own input.
+    Transform the given sentence into correct Arabic while preserving its original meaning.
+    Make sure yu return answer in pure arabic.
+    Provide only the refined answer in response.<end_of_turn>
+    <start_of_turn>user
+    Answer:{answer}<end_of_turn>
+    <start_of_turn>model
+    """
+    prompt = PromptTemplate(template=refine_template, input_variables=["answer"])
+    refined_chain = LLMChain(llm=llm, prompt=prompt)
+    arabic_response=refined_chain.run(answer)
+    return arabic_response
+
+def followup_question(input_ls):
+    followup_template = """<start_of_turn>system
+    ###Context###
+    You will be given a chat history and a question.
+    Your job is to identify whether the question is a followup question from the chat history or not.
+    If the question is a followup question then formulate a standalone question which can be understood without the chat history.
+    DO NOT answer the question, just reformulate it and return the newly created standalone question.
+    IF the question is not a followup question of chat history then return the question AS IS, without any modification whatsoever.
+    
+    ###Instructions###
+    * Read the chat history thoroughly, and identify whether the question refers to content of the chat history or not.
+    * If the latest question asks about summarizing, elaborating, or answering in bullet points, 
+      make sure that the reformulated question is framed acoordingly.
+    * Do Not return the reformulated Question in the following formats:
+        - "This is the reformulated question"
+        - "Here is the reformulated question"
+        - "Following is the reformulated question"
+    * Only return the reformulated question and nothing else, DO NOT add extra text or words from your side.
+    * IF YOU DO NOT FIND ANY CONTEXT in the question and chat history then RETURN THE QUESTION AS IT IS, without any single change whatsoever.
+    
+    ###Examples###
+    Examples of follow-up questions include:
+    - Summarize the last answer/response.
+    - Explain the previous/last answer/response in better/easy words.
+    - Elaborate one/few points from the last answer/response in more detail.
+    - Give me more examples/points for the last/previous answer/response.
+    - Compre the last 2/few responses
+    - Give me the pros and cons of the last few approaches/responses.
+    - Give the last answer/response in bullet points.
+    Other examples may include questions that are an addition of the last question like:
+    - Last_Question - "Give me the address of Riyadh branch"
+    - Latest Question- "also give me phone number" or
+    - Last Question - "Give me the contact details of the COO"
+    - Latest Question - "also the address"
+    ###Additional Info###
+    - Chat history could be upto last five questions and answers of the conversation between the Bot and User.
+    - If the chat history is null then always return the question only.
+    - keep the reformulated question precise, exact and complete.
+    - DO NOT unnecessarily add words to the question
+    - NEVER give answer, just rephrase the question if it is followup.
+    
+    This is chat history {v1}<end_of_turn>
+    <start_of_turn>user
+    Question:{v2}<end_of_turn>
+    <start_of_turn>model
+    """
+    prompt = PromptTemplate(template=followup_template, input_variables=["v1", "v2"])
+    refined_chain = LLMChain(llm=llm, prompt=prompt)
+    contexualized_question=refined_chain.run({"v1": input_ls[0], "v2": input_ls[1]})
+    return contexualized_question
+
+def translate_history(chat_history):
+    ar_en_chat_history_prompt = """<start_of_turn>system
+    You are an assistant dedicated to translate Arabic Text to English Text.
+    Your task is to translate the entire chat history between the User and Bot.
+    Response should be in the same format as the input and the order of the entire conversation should be maintained.
+    Strictly return english translated version of the entire chat history only.<end_of_turn>
+    <start_of_turn>user
+    Chat_History:{chat_history}<end_of_turn>
+    <start_of_turn>model
+    """
+    
+    prompt = PromptTemplate(template=ar_en_chat_history_prompt, input_variables=["chat_history"])
+    refined_chain = LLMChain(llm=llm, prompt=prompt)
+    chat_history_in_english = refined_chain.run(chat_history)
+    return chat_history_in_english
